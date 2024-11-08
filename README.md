@@ -24,7 +24,3 @@ git clone https://github.com/GlitchLinux/ssh-file-transfer.sh.git
 cd ssh-file-transfer.sh
 chmod +x ssh-file-transfer.sh
 bash ssh-file-transfer.sh
-
-
-
-
