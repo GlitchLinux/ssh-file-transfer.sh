@@ -14,7 +14,7 @@ The script requires the following dependencies:
 - **sshpass** for password-based SSH connection
 - **openssh-server** for SSH connection
 
-## Dependencies Installation and script execution
+## Dependencies Installation & Script Execution
 
 Run this command to install required dependencies on Debian/Ubuntu and then run the script:
 
