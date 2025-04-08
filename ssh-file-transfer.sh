@@ -1,70 +1,201 @@
 #!/bin/bash
 
-# Prompt for SSH credentials in a single field (user@ip-address)
-credentials=$(zenity --entry --title="SSH File Transfer" --text="Enter the SSH credentials (e.g., user@ip-address):")
-if [ -z "$credentials" ]; then
-  zenity --error --text="Credentials are required!"
-  exit 1
-fi
+# Function to display error and exit
+error_exit() {
+    if [ "$GUI_MODE" = true ]; then
+        zenity --error --text="$1" --width=300
+    else
+        echo "ERROR: $1" >&2
+    fi
+    exit 1
+}
 
-# Separate the username and host
-username=$(echo "$credentials" | cut -d'@' -f1)
-host=$(echo "$credentials" | cut -d'@' -f2)
+# Function to test SSH connection
+test_ssh_connection() {
+    if [ "$GUI_MODE" = true ]; then
+        if ! sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" "$username@$host" "exit" 2>&1 | \
+           zenity --progress --title="Testing Connection" --text="Connecting to $host..." --percentage=0 --pulsate --auto-close; then
+            error_exit "SSH connection failed!\n\nPossible reasons:\n1. Wrong credentials\n2. Server not reachable\n3. SSH service not running\n4. Firewall blocking port $port"
+        fi
+    else
+        echo -n "Testing SSH connection to $host... "
+        output=$(sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" -v "$username@$host" "exit" 2>&1)
+        if [ $? -ne 0 ]; then
+            echo "FAILED"
+            echo "=== Debug Information ==="
+            echo "$output"
+            error_exit "SSH connection failed!\n\nCommon solutions:\n1. Verify username/password\n2. Check if SSH is running on port $port\n3. Ensure server is reachable\n4. Check firewall settings"
+        fi
+        echo "OK"
+    fi
+}
 
-# Check if username and host were correctly extracted
-if [ -z "$username" ] || [ -z "$host" ]; then
-  zenity --error --text="Invalid format! Please enter in the format user@ip-address."
-  exit 1
-fi
+# Function to run in GUI mode
+gui_mode() {
+    GUI_MODE=true
+    
+    # Check dependencies
+    if ! command -v zenity &> /dev/null; then
+        error_exit "zenity is required for GUI mode but not installed.\nPlease install with:\nsudo apt install zenity"
+    fi
+    if ! command -v sshpass &> /dev/null; then
+        error_exit "sshpass is required but not installed.\nPlease install with:\nsudo apt install sshpass"
+    fi
 
-# Ask for the SSH password
-password=$(zenity --password --title="SSH Password" --text="Enter the SSH password for $username@$host:")
-if [ -z "$password" ]; then
-  zenity --error --text="Password is required!"
-  exit 1
-fi
+    # Get SSH credentials
+    credentials=$(zenity --entry --title="SSH File Transfer" --text="Enter SSH credentials (user@host):" --width=300)
+    [ -z "$credentials" ] && error_exit "Credentials are required!"
 
-# Optional: Ask for SSH port (default is 22)
-port=$(zenity --entry --title="SSH File Transfer" --text="Enter the SSH Port (default: 22):" --entry-text="22")
-port=${port:-22}  # Use 22 if no port is entered
+    # Validate credentials format
+    if [[ ! "$credentials" =~ ^[^@]+@[^@]+$ ]]; then
+        error_exit "Invalid format! Please use user@host format"
+    fi
 
-# Test SSH connection with sshpass and the provided password, now without a confirmation dialog
-if ! sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" "$username@$host" "exit" &>/dev/null; then
-  zenity --error --text="Connection failed! Check credentials and try again."
-  exit 1
-fi
+    username=${credentials%%@*}
+    host=${credentials#*@}
 
-# Select file or directory to transfer
-file_path=$(zenity --file-selection --title="Select File or Directory for Transfer" --filename="$HOME/" --multiple)
-if [ -z "$file_path" ]; then
-  zenity --error --text="No file or directory selected!"
-  exit 1
-fi
+    # Get password
+    password=$(zenity --password --title="SSH Authentication" --text="Enter password for $credentials:")
+    [ -z "$password" ] && error_exit "Password is required!"
 
-# Specify destination directory on the client
-destination=$(zenity --entry --title="SSH File Transfer" --text="Enter the destination path on the SSH client (e.g., /home/username/):")
-if [ -z "$destination" ]; then
-  zenity --error --text="Destination path is required!"
-  exit 1
-fi
+    # Get SSH port with default 22
+    port=$(zenity --entry --title="SSH Port" --text="Enter SSH port:" --entry-text="22")
+    port=${port:-22}
 
-# Start the transfer without a confirmation dialog
-sshpass -p "$password" scp -P "$port" -r $file_path "$username@$host:$destination" &
-transfer_pid=$!
+    # Test SSH connection
+    test_ssh_connection
 
-# Show progress immediately as transfer begins
-(
-  sleep 1  # Small delay to initiate transfer
-  while ps | grep -q "[s]cp "; do
-    echo "# Transferring $file_path to $username@$host:$destination..."
-    sleep 1
-  done
-) | zenity --progress --title="File Transfer Progress" --text="Starting transfer to $username@$host:$destination" --percentage=0 --pulsate
+    # Select files to transfer
+    files=$(zenity --file-selection --title="Select Files/Directories to Transfer" --multiple --separator=" ")
+    [ -z "$files" ] && error_exit "No files selected!"
 
-# Check if transfer was successful
-wait $transfer_pid
-if [ $? -eq 0 ]; then
-  zenity --info --text="File transfer successful!"
+    # Get destination path
+    destination=$(zenity --entry --title="Destination Path" --text="Enter destination path on remote host:" --entry-text="/home/$username/")
+    [ -z "$destination" ] && error_exit "Destination path is required!"
+
+    # Confirm transfer
+    zenity --question --title="Confirm Transfer" --text="Transfer $(echo $files | wc -w) item(s) to $host:$destination?" --width=300
+    [ $? -ne 0 ] && exit 0
+
+    # Perform transfer with progress
+    (
+        echo "10"
+        echo "# Preparing transfer..."
+        echo "30"
+        echo "# Starting file transfer..."
+        
+        # Capture scp output to handle errors
+        transfer_output=$(sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $files "$username@$host:$destination" 2>&1)
+        scp_exit=$?
+        
+        if [ $scp_exit -eq 0 ]; then
+            echo "100"
+            echo "# Transfer complete!"
+        else
+            echo "100"
+            echo "# Transfer failed!"
+            zenity --error --text="Transfer failed!\n\nError details:\n$transfer_output" --width=400
+            exit 1
+        fi
+    ) | zenity --progress --title="File Transfer" --text="Starting transfer..." --percentage=0 --auto-close
+
+    [ $? -eq 0 ] && zenity --info --text="Transfer completed successfully!" || exit 1
+}
+
+# Function to run in CLI mode
+cli_mode() {
+    GUI_MODE=false
+    
+    # Check dependencies
+    if ! command -v sshpass &> /dev/null; then
+        error_exit "sshpass is required but not installed.\nPlease install with:\nsudo apt install sshpass"
+    fi
+
+    # Get SSH credentials
+    read -p "Enter SSH credentials (user@host): " credentials
+    [ -z "$credentials" ] && error_exit "Credentials are required!"
+
+    # Validate credentials format
+    if [[ ! "$credentials" =~ ^[^@]+@[^@]+$ ]]; then
+        error_exit "Invalid format! Please use user@host format"
+    fi
+
+    username=${credentials%%@*}
+    host=${credentials#*@}
+
+    # Get password securely
+    read -s -p "Enter password for $credentials: " password
+    echo
+    [ -z "$password" ] && error_exit "Password is required!"
+
+    # Get SSH port with default 22
+    read -p "Enter SSH port [22]: " port
+    port=${port:-22}
+
+    # Test SSH connection with verbose output
+    test_ssh_connection
+
+    # Get files to transfer
+    echo "Enter paths of files/directories to transfer (space-separated, use quotes for paths with spaces):"
+    read -e -p "> " files
+    [ -z "$files" ] && error_exit "No files specified!"
+
+    # Get destination path
+    read -p "Enter destination path on remote host [/home/$username/]: " destination
+    destination=${destination:-"/home/$username/"}
+
+    # Confirm transfer
+    read -p "Transfer to $host:$destination? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
+
+    # Perform transfer with progress indicator
+    echo -n "Transferring files... "
+    spin='-\|/'
+    i=0
+    
+    # Run transfer in background and show spinner
+    (sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $files "$username@$host:$destination" > .transfer_log 2>&1) &
+    pid=$!
+    
+    while kill -0 $pid 2>/dev/null; do
+        i=$(( (i+1) %4 ))
+        printf "\rTransferring files... ${spin:$i:1}"
+        sleep 0.1
+    done
+    
+    wait $pid
+    scp_exit=$?
+    
+    if [ $scp_exit -eq 0 ]; then
+        echo -e "\rTransfer completed successfully!    "
+    else
+        echo -e "\rTransfer failed!                  "
+        echo "=== Error Details ==="
+        cat .transfer_log
+        rm -f .transfer_log
+        exit 1
+    fi
+    rm -f .transfer_log
+}
+
+# Main script
+clear
+echo "=== SSH File Transfer Script ==="
+
+# Check if running in terminal
+if [ -t 0 ]; then
+    # Interactive terminal - ask for mode
+    PS3=$'\nSelect mode (1-2): '
+    options=("GUI Mode (Graphical)" "CLI Mode (Command Line)")
+    
+    select opt in "${options[@]}"; do
+        case $REPLY in
+            1) gui_mode; break ;;
+            2) cli_mode; break ;;
+            *) echo "Invalid option. Please enter 1 or 2.";;
+        esac
+    done
 else
-  zenity --error --text="File transfer failed! Check if destination directory exists and SSH user has write permissions."
+    # Non-interactive (e.g., double-clicked) - default to GUI
+    gui_mode
 fi
