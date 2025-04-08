@@ -30,6 +30,115 @@ test_ssh_connection() {
     fi
 }
 
+# Function to transfer files with sudo support
+transfer_files() {
+    local source_files=$1
+    local destination=$2
+    local use_sudo=$3
+
+    if [ "$GUI_MODE" = true ]; then
+        (
+            echo "10"
+            echo "# Preparing transfer..."
+            echo "30"
+            echo "# Starting file transfer..."
+            
+            if [ "$use_sudo" = true ]; then
+                # Transfer to temp location first
+                temp_dir="/tmp/ssh_transfer_$(date +%s)"
+                transfer_output=$(sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$temp_dir" 2>&1)
+                scp_exit=$?
+                
+                if [ $scp_exit -eq 0 ]; then
+                    echo "50"
+                    echo "# Moving files to final destination (sudo required)..."
+                    # Move files with sudo
+                    sudo_cmd="sudo mkdir -p $(dirname "$destination") && sudo mv $temp_dir/* $destination/ && sudo rm -rf $temp_dir"
+                    transfer_output+=$'\n'$(sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" "$username@$host" "$sudo_cmd" 2>&1)
+                    scp_exit=$?
+                fi
+            else
+                # Direct transfer
+                transfer_output=$(sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$destination" 2>&1)
+                scp_exit=$?
+            fi
+
+            if [ $scp_exit -eq 0 ]; then
+                echo "100"
+                echo "# Transfer complete!"
+            else
+                echo "100"
+                echo "# Transfer failed!"
+                zenity --error --text="Transfer failed!\n\nError details:\n$transfer_output" --width=400
+                exit 1
+            fi
+        ) | zenity --progress --title="File Transfer" --text="Starting transfer..." --percentage=0 --auto-close
+    else
+        echo -n "Transferring files... "
+        spin='-\|/'
+        i=0
+        
+        if [ "$use_sudo" = true ]; then
+            # Transfer to temp location first
+            temp_dir="/tmp/ssh_transfer_$(date +%s)"
+            (sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$temp_dir" > .transfer_log 2>&1) &
+            pid=$!
+            
+            while kill -0 $pid 2>/dev/null; do
+                i=$(( (i+1) %4 ))
+                printf "\rTransferring files to temp location... ${spin:$i:1}"
+                sleep 0.1
+            done
+            
+            wait $pid
+            scp_exit=$?
+            
+            if [ $scp_exit -eq 0 ]; then
+                echo -e "\rTransferring files to temp location... OK    "
+                echo -n "Moving files to final destination (sudo required)... "
+                
+                # Move files with sudo
+                sudo_cmd="sudo mkdir -p $(dirname "$destination") && sudo mv $temp_dir/* $destination/ && sudo rm -rf $temp_dir"
+                (sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" "$username@$host" "$sudo_cmd" >> .transfer_log 2>&1) &
+                pid=$!
+                
+                while kill -0 $pid 2>/dev/null; do
+                    i=$(( (i+1) %4 ))
+                    printf "\rMoving files to final destination (sudo required)... ${spin:$i:1}"
+                    sleep 0.1
+                done
+                
+                wait $pid
+                scp_exit=$?
+            fi
+        else
+            # Direct transfer
+            (sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$destination" > .transfer_log 2>&1) &
+            pid=$!
+            
+            while kill -0 $pid 2>/dev/null; do
+                i=$(( (i+1) %4 ))
+                printf "\rTransferring files... ${spin:$i:1}"
+                sleep 0.1
+            done
+            
+            wait $pid
+            scp_exit=$?
+        fi
+        
+        if [ $scp_exit -eq 0 ]; then
+            echo -e "\rTransfer completed successfully!    "
+        else
+            echo -e "\rTransfer failed!                  "
+            echo "=== Error Details ==="
+            cat .transfer_log
+            rm -f .transfer_log
+            exit 1
+        fi
+        rm -f .transfer_log
+    fi
+}
+
 # Function to run in GUI mode
 gui_mode() {
     GUI_MODE=true
@@ -73,31 +182,19 @@ gui_mode() {
     destination=$(zenity --entry --title="Destination Path" --text="Enter destination path on remote host:" --entry-text="/home/$username/")
     [ -z "$destination" ] && error_exit "Destination path is required!"
 
+    # Check if destination requires sudo
+    use_sudo=false
+    if [[ "$destination" =~ ^/var/ || "$destination" =~ ^/etc/ || "$destination" =~ ^/usr/ || "$destination" =~ ^/root/ ]]; then
+        zenity --question --title="Privileged Directory" --text="The destination directory appears to be system-protected.\n\nDo you need to use sudo to transfer files there?" --width=400
+        [ $? -eq 0 ] && use_sudo=true
+    fi
+
     # Confirm transfer
-    zenity --question --title="Confirm Transfer" --text="Transfer $(echo $files | wc -w) item(s) to $host:$destination?" --width=300
+    zenity --question --title="Confirm Transfer" --text="Transfer $(echo $files | wc -w) item(s) to $host:$destination $( [ "$use_sudo" = true ] && echo "using sudo" )?" --width=300
     [ $? -ne 0 ] && exit 0
 
-    # Perform transfer with progress
-    (
-        echo "10"
-        echo "# Preparing transfer..."
-        echo "30"
-        echo "# Starting file transfer..."
-        
-        # Capture scp output to handle errors
-        transfer_output=$(sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $files "$username@$host:$destination" 2>&1)
-        scp_exit=$?
-        
-        if [ $scp_exit -eq 0 ]; then
-            echo "100"
-            echo "# Transfer complete!"
-        else
-            echo "100"
-            echo "# Transfer failed!"
-            zenity --error --text="Transfer failed!\n\nError details:\n$transfer_output" --width=400
-            exit 1
-        fi
-    ) | zenity --progress --title="File Transfer" --text="Starting transfer..." --percentage=0 --auto-close
+    # Perform transfer
+    transfer_files "$files" "$destination" "$use_sudo"
 
     [ $? -eq 0 ] && zenity --info --text="Transfer completed successfully!" || exit 1
 }
@@ -144,43 +241,25 @@ cli_mode() {
     read -p "Enter destination path on remote host [/home/$username/]: " destination
     destination=${destination:-"/home/$username/"}
 
+    # Check if destination requires sudo
+    use_sudo=false
+    if [[ "$destination" =~ ^/var/ || "$destination" =~ ^/etc/ || "$destination" =~ ^/usr/ || "$destination" =~ ^/root/ ]]; then
+        read -p "The destination appears to be system-protected. Use sudo for transfer? [y/N]: " sudo_choice
+        [[ "$sudo_choice" =~ ^[Yy]$ ]] && use_sudo=true
+    fi
+
     # Confirm transfer
-    read -p "Transfer to $host:$destination? [y/N]: " confirm
+    read -p "Transfer to $host:$destination $( [ "$use_sudo" = true ] && echo "using sudo" )? [y/N]: " confirm
     [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
 
-    # Perform transfer with progress indicator
-    echo -n "Transferring files... "
-    spin='-\|/'
-    i=0
-    
-    # Run transfer in background and show spinner
-    (sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $files "$username@$host:$destination" > .transfer_log 2>&1) &
-    pid=$!
-    
-    while kill -0 $pid 2>/dev/null; do
-        i=$(( (i+1) %4 ))
-        printf "\rTransferring files... ${spin:$i:1}"
-        sleep 0.1
-    done
-    
-    wait $pid
-    scp_exit=$?
-    
-    if [ $scp_exit -eq 0 ]; then
-        echo -e "\rTransfer completed successfully!    "
-    else
-        echo -e "\rTransfer failed!                  "
-        echo "=== Error Details ==="
-        cat .transfer_log
-        rm -f .transfer_log
-        exit 1
-    fi
-    rm -f .transfer_log
+    # Perform transfer
+    transfer_files "$files" "$destination" "$use_sudo"
 }
 
 # Main script
 clear
 echo "=== SSH File Transfer Script ==="
+echo "=== Supports privileged directories with sudo ==="
 
 # Check if running in terminal
 if [ -t 0 ]; then
