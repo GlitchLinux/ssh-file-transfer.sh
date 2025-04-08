@@ -1,13 +1,38 @@
 #!/bin/bash
 
+# Global variables
+GUI_MODE=false
+username=""
+host=""
+password=""
+port=22
+
 # Function to display error and exit
 error_exit() {
-    if [ "$GUI_MODE" = true ]; then
-        zenity --error --text="$1" --width=300
+    local message="$1"
+    if [ "$GUI_MODE" = true ] && [ -x "$(command -v zenity)" ]; then
+        zenity --error --text="$message" --width=300
     else
-        echo "ERROR: $1" >&2
+        echo "ERROR: $message" >&2
     fi
     exit 1
+}
+
+# Function to check dependencies
+check_dependencies() {
+    local missing=()
+    
+    if ! command -v sshpass &> /dev/null; then
+        missing+=("sshpass")
+    fi
+    
+    if [ "$GUI_MODE" = true ] && ! command -v zenity &> /dev/null; then
+        missing+=("zenity")
+    fi
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        error_exit "Missing required packages: ${missing[*]}\nInstall with: sudo apt install ${missing[*]}"
+    fi
 }
 
 # Function to test SSH connection
@@ -19,137 +44,107 @@ test_ssh_connection() {
         fi
     else
         echo -n "Testing SSH connection to $host... "
-        output=$(sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" -v "$username@$host" "exit" 2>&1)
-        if [ $? -ne 0 ]; then
+        if ! sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" "$username@$host" "exit" &>/dev/null; then
             echo "FAILED"
-            echo "=== Debug Information ==="
-            echo "$output"
-            error_exit "SSH connection failed!\n\nCommon solutions:\n1. Verify username/password\n2. Check if SSH is running on port $port\n3. Ensure server is reachable\n4. Check firewall settings"
+            error_exit "SSH connection failed! Check credentials and try again."
         fi
         echo "OK"
     fi
 }
 
-# Function to transfer files with sudo support
+# Function to transfer files
 transfer_files() {
-    local source_files=$1
-    local destination=$2
-    local use_sudo=$3
+    local source_files="$1"
+    local destination="$2"
+    local use_sudo="$3"
 
     if [ "$GUI_MODE" = true ]; then
         (
             echo "10"
             echo "# Preparing transfer..."
-            echo "30"
-            echo "# Starting file transfer..."
             
             if [ "$use_sudo" = true ]; then
-                # Transfer to temp location first
+                # Create temp directory on remote server
                 temp_dir="/tmp/ssh_transfer_$(date +%s)"
-                transfer_output=$(sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$temp_dir" 2>&1)
-                scp_exit=$?
-                
-                if [ $scp_exit -eq 0 ]; then
-                    echo "50"
-                    echo "# Moving files to final destination (sudo required)..."
-                    # Move files with sudo
-                    sudo_cmd="sudo mkdir -p $(dirname "$destination") && sudo mv $temp_dir/* $destination/ && sudo rm -rf $temp_dir"
-                    transfer_output+=$'\n'$(sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" "$username@$host" "$sudo_cmd" 2>&1)
-                    scp_exit=$?
+                echo "20"
+                echo "# Creating temp directory..."
+                if ! sshpass -p "$password" ssh -p "$port" "$username@$host" "mkdir -p '$temp_dir'"; then
+                    echo "100"
+                    error_exit "Failed to create temp directory"
+                fi
+
+                # Transfer files to temp location
+                echo "40"
+                echo "# Transferring to temp location..."
+                if ! sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$temp_dir/"; then
+                    echo "100"
+                    error_exit "Transfer to temp location failed"
+                fi
+
+                # Move files to final destination with sudo
+                echo "70"
+                echo "# Moving to final destination (sudo)..."
+                if ! sshpass -p "$password" ssh -p "$port" "$username@$host" \
+                    "sudo mkdir -p '$destination' && sudo cp -r '$temp_dir/'* '$destination/' && sudo rm -rf '$temp_dir'"; then
+                    echo "100"
+                    error_exit "Failed to move files with sudo"
                 fi
             else
                 # Direct transfer
-                transfer_output=$(sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$destination" 2>&1)
-                scp_exit=$?
+                echo "50"
+                echo "# Transferring files directly..."
+                if ! sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$destination"; then
+                    echo "100"
+                    error_exit "Direct transfer failed"
+                fi
             fi
 
-            if [ $scp_exit -eq 0 ]; then
-                echo "100"
-                echo "# Transfer complete!"
-            else
-                echo "100"
-                echo "# Transfer failed!"
-                zenity --error --text="Transfer failed!\n\nError details:\n$transfer_output" --width=400
-                exit 1
-            fi
+            echo "100"
+            echo "# Transfer complete!"
         ) | zenity --progress --title="File Transfer" --text="Starting transfer..." --percentage=0 --auto-close
     else
-        echo -n "Transferring files... "
+        echo -n "Starting transfer..."
         spin='-\|/'
         i=0
         
         if [ "$use_sudo" = true ]; then
-            # Transfer to temp location first
+            # Create temp directory
             temp_dir="/tmp/ssh_transfer_$(date +%s)"
-            (sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$temp_dir" > .transfer_log 2>&1) &
-            pid=$!
-            
-            while kill -0 $pid 2>/dev/null; do
-                i=$(( (i+1) %4 ))
-                printf "\rTransferring files to temp location... ${spin:$i:1}"
-                sleep 0.1
-            done
-            
-            wait $pid
-            scp_exit=$?
-            
-            if [ $scp_exit -eq 0 ]; then
-                echo -e "\rTransferring files to temp location... OK    "
-                echo -n "Moving files to final destination (sudo required)... "
-                
-                # Move files with sudo
-                sudo_cmd="sudo mkdir -p $(dirname "$destination") && sudo mv $temp_dir/* $destination/ && sudo rm -rf $temp_dir"
-                (sshpass -p "$password" ssh -o StrictHostKeyChecking=no -p "$port" "$username@$host" "$sudo_cmd" >> .transfer_log 2>&1) &
-                pid=$!
-                
-                while kill -0 $pid 2>/dev/null; do
-                    i=$(( (i+1) %4 ))
-                    printf "\rMoving files to final destination (sudo required)... ${spin:$i:1}"
-                    sleep 0.1
-                done
-                
-                wait $pid
-                scp_exit=$?
+            if ! sshpass -p "$password" ssh -p "$port" "$username@$host" "mkdir -p '$temp_dir'"; then
+                echo -e "\rFailed to create temp directory on server"
+                exit 1
+            fi
+
+            # Transfer to temp location
+            printf "\rTransferring to temp location... "
+            if ! sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$temp_dir/"; then
+                echo -e "\rTransfer to temp location failed"
+                exit 1
+            fi
+
+            # Move with sudo
+            printf "\rMoving to final destination with sudo... "
+            if ! sshpass -p "$password" ssh -p "$port" "$username@$host" \
+                "sudo mkdir -p '$destination' && sudo cp -r '$temp_dir/'* '$destination/' && sudo rm -rf '$temp_dir'"; then
+                echo -e "\rFailed to move files with sudo"
+                exit 1
             fi
         else
             # Direct transfer
-            (sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$destination" > .transfer_log 2>&1) &
-            pid=$!
-            
-            while kill -0 $pid 2>/dev/null; do
-                i=$(( (i+1) %4 ))
-                printf "\rTransferring files... ${spin:$i:1}"
-                sleep 0.1
-            done
-            
-            wait $pid
-            scp_exit=$?
+            if ! sshpass -p "$password" scp -P "$port" -o StrictHostKeyChecking=no -r $source_files "$username@$host:$destination"; then
+                echo -e "\rDirect transfer failed"
+                exit 1
+            fi
         fi
         
-        if [ $scp_exit -eq 0 ]; then
-            echo -e "\rTransfer completed successfully!    "
-        else
-            echo -e "\rTransfer failed!                  "
-            echo "=== Error Details ==="
-            cat .transfer_log
-            rm -f .transfer_log
-            exit 1
-        fi
-        rm -f .transfer_log
+        echo -e "\rTransfer completed successfully!    "
     fi
 }
 
 # Function to run in GUI mode
 gui_mode() {
     GUI_MODE=true
-    
-    # Check dependencies
-    if ! command -v zenity &> /dev/null; then
-        error_exit "zenity is required for GUI mode but not installed.\nPlease install with:\nsudo apt install zenity"
-    fi
-    if ! command -v sshpass &> /dev/null; then
-        error_exit "sshpass is required but not installed.\nPlease install with:\nsudo apt install sshpass"
-    fi
+    check_dependencies
 
     # Get SSH credentials
     credentials=$(zenity --entry --title="SSH File Transfer" --text="Enter SSH credentials (user@host):" --width=300)
@@ -184,7 +179,7 @@ gui_mode() {
 
     # Check if destination requires sudo
     use_sudo=false
-    if [[ "$destination" =~ ^/var/ || "$destination" =~ ^/etc/ || "$destination" =~ ^/usr/ || "$destination" =~ ^/root/ ]]; then
+    if [[ "$destination" =~ ^/(var|etc|usr|root)/ ]]; then
         zenity --question --title="Privileged Directory" --text="The destination directory appears to be system-protected.\n\nDo you need to use sudo to transfer files there?" --width=400
         [ $? -eq 0 ] && use_sudo=true
     fi
@@ -196,17 +191,14 @@ gui_mode() {
     # Perform transfer
     transfer_files "$files" "$destination" "$use_sudo"
 
-    [ $? -eq 0 ] && zenity --info --text="Transfer completed successfully!" || exit 1
+    # Verify transfer
+    zenity --info --title="Transfer Complete" --text="Files transferred to $host:$destination $( [ "$use_sudo" = true ] && echo "using sudo" )" --width=300
 }
 
 # Function to run in CLI mode
 cli_mode() {
     GUI_MODE=false
-    
-    # Check dependencies
-    if ! command -v sshpass &> /dev/null; then
-        error_exit "sshpass is required but not installed.\nPlease install with:\nsudo apt install sshpass"
-    fi
+    check_dependencies
 
     # Get SSH credentials
     read -p "Enter SSH credentials (user@host): " credentials
@@ -229,7 +221,7 @@ cli_mode() {
     read -p "Enter SSH port [22]: " port
     port=${port:-22}
 
-    # Test SSH connection with verbose output
+    # Test SSH connection
     test_ssh_connection
 
     # Get files to transfer
@@ -243,7 +235,7 @@ cli_mode() {
 
     # Check if destination requires sudo
     use_sudo=false
-    if [[ "$destination" =~ ^/var/ || "$destination" =~ ^/etc/ || "$destination" =~ ^/usr/ || "$destination" =~ ^/root/ ]]; then
+    if [[ "$destination" =~ ^/(var|etc|usr|root)/ ]]; then
         read -p "The destination appears to be system-protected. Use sudo for transfer? [y/N]: " sudo_choice
         [[ "$sudo_choice" =~ ^[Yy]$ ]] && use_sudo=true
     fi
@@ -254,27 +246,38 @@ cli_mode() {
 
     # Perform transfer
     transfer_files "$files" "$destination" "$use_sudo"
+
+    # Verify transfer
+    echo -e "\nTransfer completed $( [ "$use_sudo" = true ] && echo "with sudo" )"
 }
 
 # Main script
-clear
-echo "=== SSH File Transfer Script ==="
-echo "=== Supports privileged directories with sudo ==="
+main() {
+    clear
+    echo "=== SSH File Transfer Script ==="
+    echo "=== Supports privileged directories with sudo ==="
 
-# Check if running in terminal
-if [ -t 0 ]; then
-    # Interactive terminal - ask for mode
-    PS3=$'\nSelect mode (1-2): '
-    options=("GUI Mode (Graphical)" "CLI Mode (Command Line)")
-    
-    select opt in "${options[@]}"; do
-        case $REPLY in
-            1) gui_mode; break ;;
-            2) cli_mode; break ;;
-            *) echo "Invalid option. Please enter 1 or 2.";;
-        esac
-    done
-else
-    # Non-interactive (e.g., double-clicked) - default to GUI
-    gui_mode
-fi
+    # Check if running in terminal
+    if [ -t 0 ]; then
+        # Interactive terminal - ask for mode
+        while true; do
+            echo ""
+            echo "1) GUI Mode (Graphical)"
+            echo "2) CLI Mode (Command Line)"
+            echo ""
+            read -p "Select mode (1-2): " choice
+            
+            case $choice in
+                1) gui_mode; break ;;
+                2) cli_mode; break ;;
+                *) echo "Invalid option. Please enter 1 or 2.";;
+            esac
+        done
+    else
+        # Non-interactive (e.g., double-clicked) - default to GUI
+        gui_mode
+    fi
+}
+
+# Run main function
+main
